@@ -1,0 +1,7 @@
+.venv/
+cache/
+pilot/
+smoke/
+local_smoke*/
+__pycache__/
+*.tmp
