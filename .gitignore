@@ -2,6 +2,7 @@
 cache/
 pilot/
 smoke/
+analysis/
 local_smoke*/
 __pycache__/
 *.tmp

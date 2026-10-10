@@ -1,0 +1,2 @@
+# Install into the existing collection environment; do not reinstall its packages.
+scikit-learn>=1.5,<2

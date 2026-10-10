@@ -1,13 +1,14 @@
 # GSM8K 연구 데이터 수집
 
-`Study_Plan.md`의 Qwen2.5-1.5B 파일럿을 위한 CLI다. 문제, 모델 풀이, 실제 정답, 최종 정오, 전체 토큰의 레이어별 activation을 저장한다. 과정 오류 판정·Judge 호출·probe 학습·복구 실험은 포함하지 않는다.
+`collect.py`는 `Study_Plan.md`의 Qwen2.5-1.5B 파일럿을 위한 수집 CLI다. 문제, 모델 풀이, 실제 정답, 최종 정오, 전체 토큰의 레이어별 activation을 저장한다. `analyze.py`는 검증된 수집 결과로 확률 기준선·레이어별 선형 probe·작은 MLP를 학습해 정답/오답 판별을 평가한다. 과정 오류 판정·Judge 호출·복구 실험은 포함하지 않는다.
 
 ## Linux RTX 3090 설치·실행
 
 Python 3.11과 CUDA 12.4용 PyTorch를 사용할 수 있는 NVIDIA 드라이버가 필요하다. 아래 명령은 **연구 작업 공간 안에서** 실행한다. 예를 들어 `/work/yaicon/research_base`에 이 폴더를 복사한 뒤 해당 디렉터리로 이동한다.
 
 ```bash
-python3.11 -m venv .venv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+"$HOME/.local/bin/uv" venv --python 3.11 --seed .venv
 source .venv/bin/activate
 python -m pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 python -m pip install --no-cache-dir -r requirements.txt
@@ -102,3 +103,61 @@ record, neurons = load_layer("pilot/items/train_00042", "layer_14", "mlp_interme
 ## 검증 범위
 
 `test_collect.py`는 작은 임의 초기화 Qwen2 모델로 토큰 위치·마지막 토큰·상세 activation 값·저장/복원·재수집 비교·중단 후 재수집·손상 파일 검출·용량·숫자 판정을 검증한다. 학습된 1.5B 모델의 품질이나 원격 RTX 3090 실행 검증을 대신하지 않는다. 원격 설치 후 3문항 점검을 반드시 실행한다.
+
+## 정답·오답 판별 분석
+
+`Methodology_Exploration.md`의 방법론 1~3을 적용한다. 오류 유형 주석이 없으므로 3번은 동일 activation 특징에 대한 선형 probe와 이진 MLP 비교로 수행한다. 저장된 `correct`를 사용하고 **오답을 양성 클래스 1**로 둔다. 형식 실패·잘림도 오답에 포함하며, 풀이 과정의 오류나 오류 유형을 판정하지 않는다.
+
+수집에 사용한 Python 환경에서 분석 의존성만 추가한다. 원본 수집 환경의 패키지를 재설치하지 않는다.
+
+```bash
+python -m pip install -r requirements-analysis.txt
+python -m unittest -v test_analyze.py test_collect.py
+python analyze.py --input-dir pilot --output-dir analysis/pilot --seed 42
+```
+
+분석은 CPU에서 실행하며 모델이나 데이터셋을 다시 다운로드하지 않는다. 시작 시점에 완료·replay 검증을 통과한 문항 목록을 고정한다. 생성 실패·activation 미완료 문항은 제외하고 이유와 수를 기록한다. 완료된 activation은 한 문항의 한 레이어씩 `load_layer`로 복원하며, checksum·토큰 범위 검증이 실패하면 경로를 출력하고 중단한다. 원본 파일이 분석 중 바뀌어도 중단한다. 입력 데이터는 수정하지 않는다.
+
+문제 ID 또는 공백 정규화 후 같은 문제 텍스트는 전이적 관계까지 묶어 같은 분할에 둔다. 클래스 비율을 유지하도록 train/validation/test를 60/20/20에 가깝게 고정한다. 그룹 크기와 소수 클래스 수 때문에 정확한 비율을 만들 수 없으면 실제 분할 수를 보고한다. 각 클래스가 최소 세 개의 독립 문제 그룹에 존재하지 않으면 학습하지 않는다. 템플릿·의미적 유사성까지 자동으로 탐지하는 것은 아니다.
+
+| 방법 | 특징 | 시점 |
+| --- | --- | --- |
+| 확률 기준선 | 응답 평균·최대 entropy, 평균·최소 log probability, top-1/top-2 확률 차이의 평균·최소; 개별 점수와 결합 로지스틱 회귀 | 사후 |
+| 선형 probe | 모든 residual 레이어의 프롬프트 마지막 토큰 | 생성 전 |
+| 선형 probe | 모든 residual 레이어의 응답 마지막 토큰·응답 평균 | 사후 |
+| MLP | 생성 전·사후 각각 validation에서 선택한 선형 probe와 동일한 레이어·집계 특징 | 해당 특징과 동일 |
+
+응답 특징은 EOS를 포함한다. top-1/top-2 확률 차이는 저장된 두 log probability를 지수화한 후 뺀 값이다. 개별 점수는 entropy가 클수록, log probability·확률 차이가 작을수록 오답 점수가 높다. 개별 점수는 보정된 확률이 아니므로 예측의 `error_probability`는 `null`이고 `error_score`를 사용한다. 학습된 로지스틱 회귀·MLP는 오답 확률을 출력한다.
+
+표준화는 train에서만 학습한다. 로지스틱 회귀의 `C` 후보는 0.01, 0.1, 1, 10이다. 후보는 validation AUROC, AUPRC, 고정 후보 순서로 선택한다. 생성 전·사후 선형 probe는 각각 선택하고, MLP는 각 선형 probe의 특징을 그대로 사용한다. MLP는 은닉층 32, ReLU, Adam, 학습률 0.001, 배치 32, 최대 200 epoch이며 validation BCE loss가 20 epoch 동안 개선되지 않으면 중단하고 최선 상태를 복원한다. 임계값은 validation의 오답 F1이 최대인 값, 동률이면 가장 높은 값으로 고정한다. Test를 보고 모델이나 임계값을 다시 선택하지 않는다.
+
+```text
+analysis/pilot/
+  analysis_manifest.json     # 입력 snapshot/hash, 제외 이유, 분할, 설정, 실제 패키지 버전
+  candidates.json            # 모든 후보의 validation 지표
+  metrics.json               # 선택 결과, test 지표, 숫자 추출 성공 보조 지표
+  test_predictions.json      # 실제 정오, 오답 점수/확률, 임계값, 판정
+  report.md                  # 비교 보고서
+  models/*.pt                # 선택 모델·표준화 값·임계값 (CPU, weights_only로 읽기)
+```
+
+AUROC, 오답 AUPRC(average precision), precision/recall/F1, confusion matrix와 클래스별 문항 수를 보고한다. 숫자를 정상 추출한 비잘림 test 문항만의 보조 결과는 같은 모델·임계값을 사용한다. 단일 클래스·빈 보조 집합의 ranking 지표, 분모가 0인 분류 지표는 `null`과 사유를 기록한다. AUPRC는 오답 클래스 비율과 함께 읽어야 한다. 결과는 해당 고정 분할의 탐색 결과이며 통계적 유의성이나 다른 과제에서의 일반화를 입증하지 않는다.
+
+저장 모델로 개별 문항을 다시 판별할 수 있다. `metrics.json`의 `artifact`에 있는 실제 모델 경로를 지정한다.
+
+```python
+from pathlib import Path
+import json
+from analyze import predict_item
+
+output = Path("analysis/pilot")
+metrics = json.loads((output / "metrics.json").read_text())
+name = metrics["selections"]["post_generation_linear"]
+model_path = output / metrics["models"][name]["artifact"]
+result = predict_item(model_path, "pilot/items/train_00042")
+print(result)  # error_score, error_probability, threshold, predicted_error
+```
+
+예측 입력에 실제 정답·`correct`·과정 주석을 사용하지 않는다. 학습 때의 모델·수집 규격과 맞는 파일을 사용한다. 출력 디렉터리가 비어 있지 않으면 덮어쓰지 않으며 새 경로를 지정해야 한다. `analysis/`는 생성 결과이므로 Git에서 제외한다.
+
+`test_analyze.py`는 확률 계산·토큰 경계·그룹 분할·데이터 부족·train 전용 표준화·test 정보 누출 방지·validation 선택·단일 클래스 지표·손상 파일 중단·저장 모델 예측 재현을 작은 합성 수집 파일로 검증한다.
